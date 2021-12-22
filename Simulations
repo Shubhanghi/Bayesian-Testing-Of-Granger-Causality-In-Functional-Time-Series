@@ -1,0 +1,525 @@
+#note: loglikehood is calculated from the observed values for model m0
+
+############################################################
+# Header: some directory/sourcing info
+############################################################
+rm(list=ls(all=TRUE))
+
+# Set wd to source location:
+setwd("D:/Research Work/VFAR paper/Pollution example")
+#setwd("/home/shubhanghi/Dropbox/function AR")
+
+# Some data specs:
+useDifferences = FALSE  # Difference the yield data?  
+h = 5   
+
+############################################################
+# Model specifications
+############################################################
+pMax = 1; selectLagP = FALSE                   # either the max lag (selectLagP = TRUE) in the selection procedure or the fixed choice of the lag (selectLagP = FALSE)
+useFDLM = TRUE                                 # Use FDLM on FAR (evolution) errors, or Matern GP?
+
+nsims =10200; burnin = 500; thin = 1;	
+draws = (nsims-200)/100# MCMC parameters
+############################################################
+# Packages:
+############################################################
+library(fda); library(MCMCpack); library(vars); library(KFAS); library(dlm); library(FastGP); library(truncdist); library(forecast)
+library(openxlsx); library(mvtnorm); library(TruncatedNormal)
+# For simulations:
+library(fGarch); library(geoR); library(plot3D)
+# This may improve efficiency in some cases:
+library(compiler);  enableJIT(3)
+
+# Import Slice sampler from Neal
+source("sliceSampling.R")
+
+# Import functions:
+source("functions_file.R")
+
+# Storege:
+Niters = 1
+compTimesAll = JeAll = rhoAll = numeric(Niters) 
+if(selectLagP) propSelectedAll = matrix(0, nr=Niters, nc=pMax)
+
+timer0 = proc.time()[3]			# for timing the entire sampler
+#  for(niter in 1:Niters){
+niter =1
+Result = matrix(0,100,2)
+colnames(Result) = c("Unrestricted", " Restricted")
+###################################################################
+Data Generation
+###################################################################
+sampDesign = c(mobs=30, mobsAvg=30, randLocation = FALSE)
+DataY = simDataP(50, c('bg','bg'),'smoothGP', sampDesign ,c(0.5,0.1), 1/10)  # Y is generated dependent on X
+# DataY = simDataP(50, 'bg','smoothGP', sampDesign ,0.1, 1/10) # Y is generated independent of X
+DataX = simDataP(50, 'bg','smoothGP', sampDesign , 0.1, 1/10)
+
+# For reproducibility:
+set.seed(14850)
+Ytot = DataY$Y; Y = DataY$Y[1:40,]
+if(useDifferences){Ytot = diff(Ytot); Y = diff(Y)}
+Xtot = DataX$Y; X = DataX$Y[1:40,]
+if(useDifferences){Xtot = diff(Xtot); X = diff(X)}
+Ttot = nrow(Ytot); T = nrow(Y); forHoriz = Ttot - T
+
+tauEval = tauAll = as.numeric(colnames(Y))
+mEval = length(tauEval)
+Yobs = as.matrix(Y); Ytotobs = as.matrix(Ytot)
+Xobs = as.matrix(X); Xtotobs = as.matrix(Xtot)
+# Evaluate at these points:
+tau_star = sort(union(tauEval, seq(0, 1, length.out = 50))); 
+
+plot(as.ts(Ytotobs[,1:min(10, ncol(Ytotobs))]), main = "Y")
+plot(as.ts(Xtotobs[,1:min(10, ncol(Xtotobs))]), main = "X")
+# Additional FDLM parameters:
+fixSigma_eta = FALSE; tolFPC = 0.95	              # fix approx error variance for smoother mu_t? PVE for SVD init? 
+sampleFLCs = TRUE #(sum(colMeans(!is.na(Y)) > 0) >=  5) # if we observe fewer than 5 points, don't sample FLCs (just orthog. the spline basis)
+sampleKappas = FALSE 
+mtbar = 2*mEval
+psiInfo = getPsiInfo(c(tauEval,tauEval), m = mtbar, pMax = pMax)
+B0starY = getLowRankTPS(tau_star, m = sum(colMeans(!is.na(Y)) > 0)); B0Y = B0starY[match(tauAll, tau_star),]; 
+B0starX = getLowRankTPS(tau_star, m = sum(colMeans(!is.na(X)) > 0)); B0X = B0starX[match(tauAll, tau_star),];
+sigma_u = 1; coefPriorPrecY = diag(c(rep(10^-8, 2), rep(sigma_u^-2, ncol(B0Y)-2)))
+coefPriorPrecX = diag(c(rep(10^-8, 2), rep(sigma_u^-2, ncol(B0X)-2)))
+# Useful index:
+############################################################
+p.inds= seq(1, 2*mEval*(pMax+1), by=2*mEval)                  
+############################################################
+# Case 1: X and Y are dependent
+############################################################
+# Parameter initialization  
+############################################################
+# Initialize the overall mean 
+initMuIntY = initMean(Y, B0Y, coefPriorPrecY); muInt0Y = muIntY = initMuIntY$muInt; thetaIntY = initMuIntY$thetaInt; muIntInfoY = initMuIntY$muIntInfo; 
+muIntRepY = tcrossprod(rep(1, T), muIntY) # For easy comparisons w/ mu (below)
+sigma_uY = sqrt(sum(thetaIntY[-(1:2)]^2)/(ncol(B0Y)-2)); diag(coefPriorPrecY)[-(1:2)] = sigma_uY^-2 # Prior precision for thetaInt
+
+initMuIntX = initMean(X, B0X, coefPriorPrecX); muInt0X = muIntX = initMuIntX$muInt; thetaIntX = initMuIntX$thetaInt; muIntInfoX = initMuIntX$muIntInfo; 
+muIntRepX = tcrossprod(rep(1, T), muIntX) # For easy comparisons w/ mu (below)
+sigma_uX = sqrt(sum(thetaIntX[-(1:2)]^2)/(ncol(B0X)-2)); diag(coefPriorPrecX)[-(1:2)] = sigma_uX^-2 # Prior precision for thetaInt
+
+# Initialize mu_t's using a spline fit (w/ common smoothing parameter)
+alphaY = smoothMuInit( Y - muIntRepY, tauAll, tauEval); 
+muTotY = muIntRepY; muTotY[,match(tauEval, tauAll)] = muTotY[,match(tauEval, tauAll)] + alphaY # estimates of E[Y_t]
+
+alphaX = smoothMuInit( X - muIntRepX, tauAll, tauEval); 
+muTotX = muIntRepX; muTotX[,match(tauEval, tauAll)] = muTotX[,match(tauEval, tauAll)] + alphaX # estimates of E[X_t]
+
+sigma_nu = sqrt(sum(( Y - muTotY)^2, na.rm=TRUE)/sum(!is.na(Y)))
+sigma_omega = sqrt(sum(( X- muTotX)^2, na.rm=TRUE)/sum(!is.na(X)))
+
+alpha= cbind(alphaY,alphaX)
+mAll = length(tauAll)+length(tauAll)
+mAllY = mAll/2
+farInit = initFARkernel2(psiInfo, alpha, alpha, pMax); Psi_matrix = farInit$Gp; Psi_matrix1 = farInit$Gp1; theta_psiS = farInit$theta_psiS; farParams = farInit$farParams
+###########################################################
+evoResids = alpha; for(nj in (1:pMax)) evoResids[(pMax+1):T,] = evoResids[(pMax+1):T,] - tcrossprod(alpha[((pMax+1):T - nj),], Psi_matrix[,p.inds[nj]:(p.inds[nj+1]- 1)])
+# Initialize the evolution error covariance (+ associated parameters)
+fdlmIn = initFDLM(c(tauEval,tauEval), mtbar, evoResids, fixSigma_eta, tolFPC, sampleFLCs, Je = NULL, c(tau_star,tau_star)); covParams = fdlmIn$covParams; fdlmParams = fdlmIn$fdlmParams
+PhiMat = covParams$PhiMat; sigmaj2 = covParams$sigmaj2; sigma_eta = covParams$sigma_eta
+
+Keps = Kfun(PhiMat, diag(sigmaj2), sigma_eta);
+KepsInv = Kinvfun(PhiMat, sigmaj2, sigma_eta);
+# Initialize the evolution error covariance (+ associated parameters)
+ 
+
+# Set up and store the DLM's (for estimation AND forecasting) using KFAS structures:
+
+dlmIn = initDLMs3(Y, Psi_matrix, pMax, Ytot); Models = dlmIn$Models; ModelsFore = dlmIn$ModelsFore
+muFore =  muForeH = matrix(0, nr=Ttot-T, nc=(mAll))
+
+# And initialize the states and transition probabilities: 
+# q01 = P(sj[j] = 1 | sj[j-1] = 0), q10 = P(sj[j] = 0 | sj[j-1] = 1)
+sj = numeric(pMax) + 1; q01 = 0.01; q10 = 0.75
+
+# Store values
+J = length(sigmaj2); K = nrow(fdlmParams$xi)
+Sample_muIntY = vector(mode = "list", length = draws)
+Sample_muIntX = vector(mode = "list", length = draws)
+Sample_Keps = vector(mode = "list", length = draws)
+Sample_far = vector(mode = "list", length = draws)
+#Sample_fdlmSamp = vector(mode = "list", length = nsims)
+Sample_sigma = vector(length = draws)
+Sample_thetaIntY = matrix(0, draws,length(thetaIntY))
+Sample_thetaIntX = matrix(0, draws,length(thetaIntX))
+Sample_sigmaeta = vector(length = draws)
+Sample_sigmaj2 = matrix(0,draws,J)
+Sample_lambdaphi = matrix(0,draws,J)
+Sample_xi = array(0, dim = c(draws, K, J))
+Sample_lambdaPsi = vector(length = draws)
+Sample_thetapsiscale = vector(length = draws)
+Sample_thetapsiS = matrix(0,draws, nrow(theta_psiS))
+sum_Keps = matrix(0,mAll,mAll)
+sum_muInt = rep(0,mAll)
+sum_Gp = matrix(0,mAll,mAll)
+############################################################
+timeri = proc.time()[3]
+S=0
+for(nsi in 1:nsims){
+  ######################################################
+  # Sample the states and transition probabilities:
+  ######################################################
+  #if(selectLagP){samplesj = samplePsiStates(sj, q01, q10, mu, Gp, Gp1, KepsInv, probS1equalsOne = 0.9, randomizeOrder = (nsi > burnin/2)); sj = samplesj$sj; Gp = samplesj$Gp}
+  if(selectLagP && nsi > 100){samplesj = samplePsiStates(sj, q01, q10, muY, GpY1, Gp1Y1, KepsInv, probS1equalsOne = 0.9, randomizeOrder = (nsi > burnin/2)); sj = samplesj$sj; GpY1 = samplesj$Gp}
+  ######################################################
+  
+  # Sample the FAR kernel operator(s) and associated parameters:
+  farSamp = sampleFARkernel(Psi_matrix, Psi_matrix1, psiInfo, alpha, alpha, KepsInv, sj, farParams, pMax, sampleKappas); Psi_matrix = farSamp$Gp; Psi_matrix1 = farSamp$Gp1; theta_psiS = farSamp$theta_psiS; farParams = farSamp$farParams
+  
+  # # Compute the evolution errors (only loop over those for which sj[j] != 0)
+  allj = 1:pMax; allj = allj[which(sj==1)]; 
+  evoResids = alpha; for(aj in allj) evoResids[(pMax+1):T,] = evoResids[(pMax+1):T,] - tcrossprod(alpha[((pMax+1):T - aj),], sj[aj]*Psi_matrix[,p.inds[aj]:(p.inds[aj+1] - 1)])
+  # Sample the relevant FDLM parameters:
+  fdlmSamp = sampleFDLM(evoResids, covParams, fdlmParams, fixSigma_eta, sampleFLCs); covParams = fdlmSamp$covParams; fdlmParams = fdlmSamp$fdlmParams; 
+  PhiMat = covParams$PhiMat; sigmaj2 = covParams$sigmaj2; sigma_eta = covParams$sigma_eta
+  
+  # Compute the innovation covariance and its inverse using the FDLM simplifications:
+  Keps = Kfun(PhiMat, diag(sigmaj2), sigma_eta) 
+  KepsInv = Kinvfun(PhiMat, sigmaj2, sigma_eta)
+  
+  # Observation error variance and covariance:
+  sigma_nu = sqrt(1/rgamma(1, shape = (0.001 + sum(!is.na(Y))/2), rate = (0.001 +sum((Y - muTotY)^2, na.rm=TRUE)/2)))
+  sigma_omega = sqrt(1/rgamma(1, shape = (0.001 + sum(!is.na(X))/2), rate = (0.001 +sum((X - muTotX)^2, na.rm=TRUE)/2)))
+  
+  # Select the DLM w/ the smallest necessary FAR lag:
+  if(sum(sj) == 0){
+    jstar = 1; Tmat = matrix(0, nr=(mAll),nc=(mAll))
+  } else{jstar = max(which(sj==1)); Tmat = Psi_matrix[, 1:(jstar*mAll)]}
+  Model = Models[[jstar]]
+  
+  #Specify values to the DLM Model
+  Model$y =  Y - muIntRepY;  # Centering
+  Model$H[,,1] = diag(sigma_nu^2, (mAll/2));  Model$T[1:(mAll),1:(mAll),1] = Tmat;  Model$Q[1:(mAll),1:(mAll),1] = Model$P1[1:(mAll),1:(mAll)] =  Keps
+  
+  #Sample alpha_t's
+  alpha = simulateSSM(Model, "states", nsim = 1, antithetics=FALSE, filtered=FALSE)[,1:(mAll),1]
+  
+  # Same with the forecast data:
+  ModelFore = ModelsFore[[jstar]]; ModelFore$y = Ytot - tcrossprod(rep(1, Ttot), muIntY)
+  ModelFore$H[,,1] = diag(sigma_nu^2, (mAll/2)); ModelFore$T[1:(mAll),1:(mAll),1] = Tmat;  ModelFore$Q[1:(mAll),1:(mAll),1] = ModelFore$P1[1:(mAll),1:(mAll)] = Keps
+  
+  # Filtering produces one-step forecasts
+  kfstemp = KFS(ModelFore, filtering="state", smoothing="none")
+  # For h-step forecast (h-1 steps ahead of 1-step forecast)
+  Ghm1 = ModelFore$T[,,1]; if(h > 2){for(hi in 1:(h-2)) Ghm1 = Ghm1%*%ModelFore$T[,,1]} 
+  
+  muForeH = cbind(tcrossprod(rep(1, forHoriz), muIntY),tcrossprod(rep(1, forHoriz), muIntX)) +  tcrossprod(kfstemp$a[(T+1):Ttot,], Ghm1)[,1:(mAll)]   
+  for(ti in (T+1):Ttot) muFore[ti - T, ] = c(muIntY,muIntX) + kfstemp$a[ti,1:(mAll)] + crossprod(chol(kfstemp$P[1:(mAll),1:(mAll),ti]), rnorm(mEval+mEval)) 
+  
+  # Overall mean function:
+  alphaY = alpha[,1:(mAll/2)]  
+  alphaX = alpha[,((mAll/2)+1):(mAll)]
+  
+  #sample muY and muX
+  muIntSampY = sampleMuInt(Y - alphaY, thetaIntY,B0Y, sigma_nu, muIntInfoY, coefPriorPrecY); muIntY = muIntSampY$muInt; thetaIntY = muIntSampY$thetaInt
+  muIntRepY = tcrossprod(rep(1, T), muIntY)
+  # What we're really interested in: the non-centered parameter
+  muTotY = muIntRepY; muTotY[,match(tauEval, tauAll)] = muTotY[,match(tauEval, tauAll)] + alphaY # estimates of Y_t
+  
+  muIntSampX = sampleMuInt(X - alphaX, thetaIntX,B0X, sigma_omega, muIntInfoX, coefPriorPrecX); muIntX = muIntSampX$muInt; thetaIntX = muIntSampX$thetaInt
+  muIntRepX = tcrossprod(rep(1, T), muIntX)
+  # What we're really interested in: the non-centered parameter
+  muTotX = muIntRepX; muTotX[,match(tauEval, tauAll)] = muTotX[,match(tauEval, tauAll)] + alphaX # estimates of Y_t
+  
+  if(nsi > 200 && (nsi-1)%%100 == 0)
+  { S = S+1 
+  ## Give their values
+  Sample_Keps[[S]] = Keps
+  sum_Keps = sum_Keps+Keps
+  Sample_thetaIntY[S,] = muIntSampY$thetaInt
+  Sample_thetaIntX[S,] = muIntSampX$thetaInt
+  Sample_sigma[S] = sigma_nu
+  Sample_sigmaeta[S] = sigma_eta
+  Sample_sigmaj2[S,] = sigmaj2
+  Sample_lambdaphi[S,] = fdlmParams$lambdaPhi
+  Sample_xi[S, , ] = fdlmParams$xi
+  Sample_lambdaPsi[S] = farSamp$farParams$lambdaPsi
+  Sample_thetapsiscale[S] = farSamp$farParams$theta_psi_scale
+  Sample_thetapsiS[S, ] = farSamp$theta_psiS
+  # #Sample_fdlmSamp[[nsi]] = fdlmSamp
+  Sample_muIntY[[S]] = muIntSampY
+  Sample_muIntX[[S]] = muIntSampX
+  sum_muInt = sum_muInt + c(muIntSampY$muInt,muIntSampX$muInt)
+  Sample_far[[S]] = farSamp
+  sum_Gp = sum_Gp+farSamp$Gp}
+  computeTimeRemaining(nsi, timeri, nsims)
+  
+}
+
+Sample_all = NULL
+Sample_all = cbind(Sample_thetaIntY,Sample_thetaIntX,Sample_sigma,Sample_sigmaeta,Sample_sigmaj2,Sample_lambdaphi)
+count  = 0 ; SampleXi = matrix(0, S, (K*J))
+for(i in 1:K)
+{for(j in 1:J)
+{count = count +1
+SampleXi[,count] = Sample_xi[,i,j]}}
+Sample_all = cbind(Sample_all,SampleXi, Sample_lambdaPsi,Sample_thetapsiscale,Sample_thetapsiS)
+#write.xlsx(Sample_all,file = "combined_samplesX.xlsx",colnames = TRUE)
+## K-variate truncated normal distribution
+
+L = ncol(Sample_all)
+mean_all = colMeans(Sample_all)
+var_all = cov(Sample_all)
+diag(var_all) = 25*diag(var_all)
+mean_Keps = (1/S)*sum_Keps
+mean_muInt = (1/S)*sum_muInt
+mean_Gp = (1/S)*sum_Gp
+
+value = NULL
+deviation = NULL
+Pd_total = NULL
+pd_yt = NULL
+h_theta = NULL
+Z = as.matrix(Model$Z[,,1])
+
+for(nsi in 1:S)
+{
+  h_theta[nsi] = -(0.5*L*log(2*pi)) - (0.5*log(abs(det(var_all)))) - (0.5*(t(as.matrix(Sample_all[nsi,]-mean_all))%*%inv(var_all)%*%(as.matrix(Sample_all[nsi,]-mean_all))))
+  #h_theta1 = log(dmvnorm(Sample_all[nsi,],mean = mean_all, sigma = var_all))
+  PdSigma_nu = ((10^-3 -1)*log(Sample_sigma[nsi]^(-2)))-(log(gamma(10^-3)))-((10^-3)*log(10^-3))-((10^-3)*Sample_sigma[nsi]^(-2))
+  Pd_et = prior_ejt(Sample_sigmaeta[nsi], Sample_sigmaj2[nsi,])
+  Pd_flc = prior_phij(Sample_lambdaphi[nsi,], Sample_xi[nsi, , ])
+  Pd_muY = prior_mu(Sample_thetaIntY[nsi,])
+  Pd_muX = prior_mu(Sample_thetaIntX[nsi,])
+  Pd_far = prior_far(1,psiInfo,Sample_lambdaPsi[nsi],Sample_thetapsiscale[nsi], Sample_thetapsiS[nsi, ])
+  Pd_total[nsi] = PdSigma_nu+Pd_et+Pd_flc+Pd_muY+Pd_muX+Pd_far
+  log_pd_yt = vector(length = mAll)
+  SigmaTbyT = diag(mAll)
+  for (i in 1:T) {   
+    alpha_t = Sample_far[[nsi]]$Gp%*%as.matrix(c(alphaY[i,],alphaX[i,]))
+    mean_yt = Z%*%c(Sample_muIntY[[nsi]]$muInt,Sample_muIntX[[nsi]]$muInt) + Z%*%alpha_t
+    Sigma_tilde = (Sample_far[[nsi]]$Gp%*%SigmaTbyT%*%t(Sample_far[[nsi]]$Gp)) + Sample_Keps[[nsi]]
+    var_yt = diag(Sample_sigma[nsi], mAllY) + Z%*%Sigma_tilde%*%t(Z)
+    log_pd_yt[i] = -(0.5*mAllY*log(2*pi)) - (0.5*log(abs(det(var_yt)))) - 0.5*t(as.matrix(muTotY[i,]-mean_yt))%*%inv(var_yt)%*%(as.matrix(muTotY[i,]-mean_yt))
+    vt = muTotY[i,] - Z%*%c(Sample_muIntY[[nsi]]$muInt,Sample_muIntX[[nsi]]$muInt) - Z%*%alpha_t
+    Kt =  (Sigma_tilde%*%t(Z))%*% inv(var_yt)
+    SigmaTbyT = (diag(mAll) - Kt%*%Z)%*%Sigma_tilde
+  }
+  pd_yt[nsi] = sum(log_pd_yt)
+  value[nsi] =  h_theta[nsi]- Pd_total[nsi] - pd_yt[nsi]
+  deviation[nsi] = -2*pd_yt[nsi]
+}
+Result[,1] = value
+
+
+###############################################################################
+# Case 2: X and Y are independent
+###############################################################################
+# Parameter initialization  
+############################################################
+# Initialize the overall mean 
+initMuIntY = initMean(Y, B0Y, coefPriorPrecY); muInt0Y = muIntY = initMuIntY$muInt; thetaIntY = initMuIntY$thetaInt; muIntInfoY = initMuIntY$muIntInfo; 
+muIntRepY = tcrossprod(rep(1, T), muIntY) # For easy comparisons w/ mu (below)
+sigma_uY = sqrt(sum(thetaIntY[-(1:2)]^2)/(ncol(B0Y)-2)); diag(coefPriorPrecY)[-(1:2)] = sigma_uY^-2 # Prior precision for thetaInt
+
+initMuIntX = initMean(X, B0X, coefPriorPrecX); muInt0X = muIntX = initMuIntX$muInt; thetaIntX = initMuIntX$thetaInt; muIntInfoX = initMuIntX$muIntInfo; 
+muIntRepX = tcrossprod(rep(1, T), muIntX) # For easy comparisons w/ mu (below)
+sigma_uX = sqrt(sum(thetaIntX[-(1:2)]^2)/(ncol(B0X)-2)); diag(coefPriorPrecX)[-(1:2)] = sigma_uX^-2 # Prior precision for thetaInt
+
+# Initialize mu_t's using a spline fit (w/ common smoothing parameter)
+alphaY = smoothMuInit( Y - muIntRepY, tauAll, tauEval); 
+muTotY = muIntRepY; muTotY[,match(tauEval, tauAll)] = muTotY[,match(tauEval, tauAll)] + alphaY # estimates of E[Y_t]
+
+alphaX = smoothMuInit( X - muIntRepX, tauAll, tauEval); 
+muTotX = muIntRepX; muTotX[,match(tauEval, tauAll)] = muTotX[,match(tauEval, tauAll)] + alphaX # estimates of E[X_t]
+
+sigma_nu = sqrt(sum(( Y - muTotY)^2, na.rm=TRUE)/sum(!is.na(Y)))
+sigma_omega = sqrt(sum(( X- muTotX)^2, na.rm=TRUE)/sum(!is.na(X)))
+
+alpha= cbind(alphaY,alphaX)
+mAll = length(tauAll)+length(tauAll)
+mAllY = mAll/2
+farInit = initFARkernel2(psiInfo, alpha, alpha, pMax); Psi_matrix = farInit$Gp; Psi_matrix1 = farInit$Gp1; theta_psiS = farInit$theta_psiS; farParams = farInit$farParams
+Psi_matrix[1:mAllY,(mAllY+1):mAll]=Psi_matrix1[1:mAllY,(mAllY+1):mAll]=0
+Psi_matrix[(mAllY+1):mAll,1:mAllY]=Psi_matrix1[(mAllY+1):mAll,1:mAllY]=0
+###########################################################
+evoResids = alpha; for(nj in (1:pMax)) evoResids[(pMax+1):T,] = evoResids[(pMax+1):T,] - tcrossprod(alpha[((pMax+1):T - nj),], Psi_matrix[,p.inds[nj]:(p.inds[nj+1]- 1)])
+# Initialize the evolution error covariance (+ associated parameters)
+fdlmIn = initFDLM(c(tauEval,tauEval), mtbar, evoResids, fixSigma_eta, tolFPC, sampleFLCs, Je = NULL, c(tau_star,tau_star)); covParams = fdlmIn$covParams; fdlmParams = fdlmIn$fdlmParams
+PhiMat = covParams$PhiMat; sigmaj2 = covParams$sigmaj2; sigma_eta = covParams$sigma_eta
+
+Keps = Kfun(PhiMat, diag(sigmaj2), sigma_eta);
+KepsInv = Kinvfun(PhiMat, sigmaj2, sigma_eta);
+# Initialize the evolution error covariance (+ associated parameters)
+
+
+# Set up and store the DLM's (for estimation AND forecasting) using KFAS structures:
+
+dlmIn = initDLMs3(Y, Psi_matrix, pMax, Ytot); Models = dlmIn$Models; ModelsFore = dlmIn$ModelsFore
+muFore =  muForeH = matrix(0, nr=Ttot-T, nc=(mAll))
+
+# And initialize the states and transition probabilities: 
+# q01 = P(sj[j] = 1 | sj[j-1] = 0), q10 = P(sj[j] = 0 | sj[j-1] = 1)
+sj = numeric(pMax) + 1; q01 = 0.01; q10 = 0.75
+
+# Store values
+J = length(sigmaj2); K = nrow(fdlmParams$xi)
+Sample_muIntY = vector(mode = "list", length = draws)
+Sample_muIntX = vector(mode = "list", length = draws)
+Sample_Keps = vector(mode = "list", length = draws)
+Sample_far = vector(mode = "list", length = draws)
+#Sample_fdlmSamp = vector(mode = "list", length = nsims)
+Sample_sigma = vector(length = draws)
+Sample_thetaIntY = matrix(0, draws,length(thetaIntY))
+Sample_thetaIntX = matrix(0, draws,length(thetaIntX))
+Sample_sigmaeta = vector(length = draws)
+Sample_sigmaj2 = matrix(0,draws,J)
+Sample_lambdaphi = matrix(0,draws,J)
+Sample_xi = array(0, dim = c(draws, K, J))
+Sample_lambdaPsi = vector(length = draws)
+Sample_thetapsiscale = vector(length = draws)
+Sample_thetapsiS = matrix(0,draws, nrow(theta_psiS))
+sum_Keps = matrix(0,mAll,mAll)
+sum_muInt = rep(0,mAll)
+sum_Gp = matrix(0,mAll,mAll)
+############################################################
+timeri = proc.time()[3]
+S=0
+for(nsi in 1:nsims){
+  ######################################################
+  # Sample the states and transition probabilities:
+  ######################################################
+  #if(selectLagP){samplesj = samplePsiStates(sj, q01, q10, mu, Gp, Gp1, KepsInv, probS1equalsOne = 0.9, randomizeOrder = (nsi > burnin/2)); sj = samplesj$sj; Gp = samplesj$Gp}
+  if(selectLagP && nsi > 100){samplesj = samplePsiStates(sj, q01, q10, muY, GpY1, Gp1Y1, KepsInv, probS1equalsOne = 0.9, randomizeOrder = (nsi > burnin/2)); sj = samplesj$sj; GpY1 = samplesj$Gp}
+  ######################################################
+  
+  # Sample the FAR kernel operator(s) and associated parameters:
+  farSamp = sampleFARkernel(Psi_matrix, Psi_matrix1, psiInfo, alpha, alpha, KepsInv, sj, farParams, pMax, sampleKappas); Psi_matrix = farSamp$Gp; Psi_matrix1 = farSamp$Gp1; theta_psiS = farSamp$theta_psiS; farParams = farSamp$farParams
+  Psi_matrix[1:mAllY,(mAllY+1):mAll]=Psi_matrix1[1:mAllY,(mAllY+1):mAll]=0
+  Psi_matrix[(mAllY+1):mAll,1:mAllY]=Psi_matrix1[(mAllY+1):mAll,1:mAllY]=0
+  
+  # # Compute the evolution errors (only loop over those for which sj[j] != 0)
+  allj = 1:pMax; allj = allj[which(sj==1)]; 
+  evoResids = alpha; for(aj in allj) evoResids[(pMax+1):T,] = evoResids[(pMax+1):T,] - tcrossprod(alpha[((pMax+1):T - aj),], sj[aj]*Psi_matrix[,p.inds[aj]:(p.inds[aj+1] - 1)])
+  # Sample the relevant FDLM parameters:
+  fdlmSamp = sampleFDLM(evoResids, covParams, fdlmParams, fixSigma_eta, sampleFLCs); covParams = fdlmSamp$covParams; fdlmParams = fdlmSamp$fdlmParams; 
+  PhiMat = covParams$PhiMat; sigmaj2 = covParams$sigmaj2; sigma_eta = covParams$sigma_eta
+  
+  # Compute the innovation covariance and its inverse using the FDLM simplifications:
+  Keps = Kfun(PhiMat, diag(sigmaj2), sigma_eta) 
+  KepsInv = Kinvfun(PhiMat, sigmaj2, sigma_eta)
+  
+  # Observation error variance and covariance:
+  sigma_nu = sqrt(1/rgamma(1, shape = (0.001 + sum(!is.na(Y))/2), rate = (0.001 +sum((Y - muTotY)^2, na.rm=TRUE)/2)))
+  sigma_omega = sqrt(1/rgamma(1, shape = (0.001 + sum(!is.na(X))/2), rate = (0.001 +sum((X - muTotX)^2, na.rm=TRUE)/2)))
+  
+  # Select the DLM w/ the smallest necessary FAR lag:
+  if(sum(sj) == 0){
+    jstar = 1; Tmat = matrix(0, nr=(mAll),nc=(mAll))
+  } else{jstar = max(which(sj==1)); Tmat = Psi_matrix[, 1:(jstar*mAll)]}
+  Model = Models[[jstar]]
+  
+  #Specify values to the DLM Model
+  Model$y =  Y - muIntRepY;  # Centering
+  Model$H[,,1] = diag(sigma_nu^2, (mAll/2));  Model$T[1:(mAll),1:(mAll),1] = Tmat;  Model$Q[1:(mAll),1:(mAll),1] = Model$P1[1:(mAll),1:(mAll)] =  Keps
+  
+  #Sample alpha_t's
+  alpha = simulateSSM(Model, "states", nsim = 1, antithetics=FALSE, filtered=FALSE)[,1:(mAll),1]
+  
+  # Same with the forecast data:
+  ModelFore = ModelsFore[[jstar]]; ModelFore$y = Ytot - tcrossprod(rep(1, Ttot), muIntY)
+  ModelFore$H[,,1] = diag(sigma_nu^2, (mAll/2)); ModelFore$T[1:(mAll),1:(mAll),1] = Tmat;  ModelFore$Q[1:(mAll),1:(mAll),1] = ModelFore$P1[1:(mAll),1:(mAll)] = Keps
+  
+  # Filtering produces one-step forecasts
+  kfstemp = KFS(ModelFore, filtering="state", smoothing="none")
+  # For h-step forecast (h-1 steps ahead of 1-step forecast)
+  Ghm1 = ModelFore$T[,,1]; if(h > 2){for(hi in 1:(h-2)) Ghm1 = Ghm1%*%ModelFore$T[,,1]} 
+  
+  muForeH = cbind(tcrossprod(rep(1, forHoriz), muIntY),tcrossprod(rep(1, forHoriz), muIntX)) +  tcrossprod(kfstemp$a[(T+1):Ttot,], Ghm1)[,1:(mAll)]   
+  for(ti in (T+1):Ttot) muFore[ti - T, ] = c(muIntY,muIntX) + kfstemp$a[ti,1:(mAll)] + crossprod(chol(kfstemp$P[1:(mAll),1:(mAll),ti]), rnorm(mEval+mEval)) 
+  
+  # Overall mean function:
+  alphaY = alpha[,1:(mAll/2)]  
+  alphaX = alpha[,((mAll/2)+1):(mAll)]
+  
+  #sample muY and muX
+  muIntSampY = sampleMuInt(Y - alphaY, thetaIntY,B0Y, sigma_nu, muIntInfoY, coefPriorPrecY); muIntY = muIntSampY$muInt; thetaIntY = muIntSampY$thetaInt
+  muIntRepY = tcrossprod(rep(1, T), muIntY)
+  # What we're really interested in: the non-centered parameter
+  muTotY = muIntRepY; muTotY[,match(tauEval, tauAll)] = muTotY[,match(tauEval, tauAll)] + alphaY # estimates of Y_t
+  
+  muIntSampX = sampleMuInt(X - alphaX, thetaIntX,B0X, sigma_omega, muIntInfoX, coefPriorPrecX); muIntX = muIntSampX$muInt; thetaIntX = muIntSampX$thetaInt
+  muIntRepX = tcrossprod(rep(1, T), muIntX)
+  # What we're really interested in: the non-centered parameter
+  muTotX = muIntRepX; muTotX[,match(tauEval, tauAll)] = muTotX[,match(tauEval, tauAll)] + alphaX # estimates of Y_t
+  
+  if(nsi > 200 && (nsi-1)%%100 == 0)
+  { S = S+1 
+  ## Give their values
+  Sample_Keps[[S]] = Keps
+  sum_Keps = sum_Keps+Keps
+  Sample_thetaIntY[S,] = muIntSampY$thetaInt
+  Sample_thetaIntX[S,] = muIntSampX$thetaInt
+  Sample_sigma[S] = sigma_nu
+  Sample_sigmaeta[S] = sigma_eta
+  Sample_sigmaj2[S,] = sigmaj2
+  Sample_lambdaphi[S,] = fdlmParams$lambdaPhi
+  Sample_xi[S, , ] = fdlmParams$xi
+  Sample_lambdaPsi[S] = farSamp$farParams$lambdaPsi
+  Sample_thetapsiscale[S] = farSamp$farParams$theta_psi_scale
+  Sample_thetapsiS[S, ] = farSamp$theta_psiS
+  # #Sample_fdlmSamp[[nsi]] = fdlmSamp
+  Sample_muIntY[[S]] = muIntSampY
+  Sample_muIntX[[S]] = muIntSampX
+  sum_muInt = sum_muInt + c(muIntSampY$muInt,muIntSampX$muInt)
+  Sample_far[[S]] = farSamp
+  sum_Gp = sum_Gp+farSamp$Gp}
+  computeTimeRemaining(nsi, timeri, nsims)
+  
+}
+
+Sample_all = NULL
+Sample_all = cbind(Sample_thetaIntY,Sample_thetaIntX,Sample_sigma,Sample_sigmaeta,Sample_sigmaj2,Sample_lambdaphi)
+count  = 0 ; SampleXi = matrix(0, S, (K*J))
+for(i in 1:K)
+{for(j in 1:J)
+{count = count +1
+SampleXi[,count] = Sample_xi[,i,j]}}
+Sample_all = cbind(Sample_all,SampleXi, Sample_lambdaPsi,Sample_thetapsiscale,Sample_thetapsiS)
+#write.xlsx(Sample_all,file = "combined_samplesX.xlsx",colnames = TRUE)
+## K-variate truncated normal distribution
+
+L = ncol(Sample_all)
+mean_all = colMeans(Sample_all)
+var_all = cov(Sample_all)
+diag(var_all) = 25*diag(var_all)
+mean_Keps = (1/S)*sum_Keps
+mean_muInt = (1/S)*sum_muInt
+mean_Gp = (1/S)*sum_Gp
+
+value = NULL
+deviation = NULL
+Pd_total = NULL
+pd_yt = NULL
+h_theta = NULL
+Z = as.matrix(Model$Z[,,1])
+
+for(nsi in 1:S)
+{
+  h_theta[nsi] = -(0.5*L*log(2*pi)) - (0.5*log(abs(det(var_all)))) - (0.5*(t(as.matrix(Sample_all[nsi,]-mean_all))%*%inv(var_all)%*%(as.matrix(Sample_all[nsi,]-mean_all))))
+  #h_theta1 = log(dmvnorm(Sample_all[nsi,],mean = mean_all, sigma = var_all))
+  PdSigma_nu = ((10^-3 -1)*log(Sample_sigma[nsi]^(-2)))-(log(gamma(10^-3)))-((10^-3)*log(10^-3))-((10^-3)*Sample_sigma[nsi]^(-2))
+  Pd_et = prior_ejt(Sample_sigmaeta[nsi], Sample_sigmaj2[nsi,])
+  Pd_flc = prior_phij(Sample_lambdaphi[nsi,], Sample_xi[nsi, , ])
+  Pd_muY = prior_mu(Sample_thetaIntY[nsi,])
+  Pd_muX = prior_mu(Sample_thetaIntX[nsi,])
+  Pd_far = prior_far(1,psiInfo,Sample_lambdaPsi[nsi],Sample_thetapsiscale[nsi], Sample_thetapsiS[nsi, ])
+  Pd_total[nsi] = PdSigma_nu+Pd_et+Pd_flc+Pd_muY+Pd_muX+Pd_far
+  log_pd_yt = vector(length = mAll)
+  SigmaTbyT = diag(mAll)
+  for (i in 1:T) {   
+    alpha_t = Sample_far[[nsi]]$Gp%*%as.matrix(c(alphaY[i,],alphaX[i,]))
+    mean_yt = Z%*%c(Sample_muIntY[[nsi]]$muInt,Sample_muIntX[[nsi]]$muInt) + Z%*%alpha_t
+    Sigma_tilde = (Sample_far[[nsi]]$Gp%*%SigmaTbyT%*%t(Sample_far[[nsi]]$Gp)) + Sample_Keps[[nsi]]
+    var_yt = diag(Sample_sigma[nsi], mAllY) + Z%*%Sigma_tilde%*%t(Z)
+    log_pd_yt[i] = -(0.5*mAllY*log(2*pi)) - (0.5*log(abs(det(var_yt)))) - 0.5*t(as.matrix(muTotY[i,]-mean_yt))%*%inv(var_yt)%*%(as.matrix(muTotY[i,]-mean_yt))
+    vt = muTotY[i,] - Z%*%c(Sample_muIntY[[nsi]]$muInt,Sample_muIntX[[nsi]]$muInt) - Z%*%alpha_t
+    Kt =  (Sigma_tilde%*%t(Z))%*% inv(var_yt)
+    SigmaTbyT = (diag(mAll) - Kt%*%Z)%*%Sigma_tilde
+  }
+  pd_yt[nsi] = sum(log_pd_yt)
+  value[nsi] =  h_theta[nsi]- Pd_total[nsi] - pd_yt[nsi]
+  deviation[nsi] = -2*pd_yt[nsi]
+}
+Result[,2] = value
